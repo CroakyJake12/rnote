@@ -33,4 +33,7 @@ svg = { workspace = true }
 tracing = { workspace = true }
 
 [features]
+# Preserve every native geometry f64 when selected by an exact-precision consumer.
+# Without this feature the existing dp3 serialization remains byte-for-byte unchanged.
+lossless-serialization = []
 clap-derive = ["dep:clap"]

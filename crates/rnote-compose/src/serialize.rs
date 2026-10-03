@@ -7,8 +7,15 @@ pub mod f64_dp3 {
 
     /// Serialize a [f64] rounded to 3 decimal places
     pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
-        const D: f64 = (10_u32.pow(3)) as f64;
-        ((v * D).round() / D).serialize(s)
+        #[cfg(feature = "lossless-serialization")]
+        {
+            v.serialize(s)
+        }
+        #[cfg(not(feature = "lossless-serialization"))]
+        {
+            const D: f64 = (10_u32.pow(3)) as f64;
+            ((v * D).round() / D).serialize(s)
+        }
     }
 
     /// Deserialize a [f64]
@@ -25,9 +32,16 @@ pub mod glam_vector2_dp3 {
 
     /// Serialize a [`Vector2`] rounded to 3 decimal places
     pub fn serialize<S: Serializer>(v: &Vector2, s: S) -> Result<S::Ok, S::Error> {
-        const SCALE: f64 = (10_u32.pow(3)) as f64;
-        let r: p2d::math::Vec2 = (v * SCALE).round() / SCALE;
-        r.serialize(s)
+        #[cfg(feature = "lossless-serialization")]
+        {
+            v.serialize(s)
+        }
+        #[cfg(not(feature = "lossless-serialization"))]
+        {
+            const SCALE: f64 = (10_u32.pow(3)) as f64;
+            let r: p2d::math::Vec2 = (v * SCALE).round() / SCALE;
+            r.serialize(s)
+        }
     }
 
     /// Deserialize a [`Vector2`]
@@ -39,17 +53,25 @@ pub mod glam_vector2_dp3 {
 /// (De)Serialize a [`p2d::glamx::DAffine2`] rounded to 3 decimal places
 pub mod glam_daffine2_f64_dp3 {
     use p2d::glamx::DAffine2;
+    #[cfg(not(feature = "lossless-serialization"))]
     use p2d::math::Vector2;
     use serde::{Deserialize, Serialize};
     use serde::{Deserializer, Serializer};
 
     /// Serialize a [`DAffine2`] rounded to 3 decimal places
     pub fn serialize<S: Serializer>(v: &DAffine2, serializer: S) -> Result<S::Ok, S::Error> {
-        const SCALE: Vector2 = Vector2::splat(10_u32.pow(3) as f64);
-        let x_axis = (v.x_axis * SCALE).round() / SCALE;
-        let y_axis = (v.y_axis * SCALE).round() / SCALE;
-        let z_axis = (v.z_axis * SCALE).round() / SCALE;
-        DAffine2::from_cols(x_axis, y_axis, z_axis).serialize(serializer)
+        #[cfg(feature = "lossless-serialization")]
+        {
+            v.serialize(serializer)
+        }
+        #[cfg(not(feature = "lossless-serialization"))]
+        {
+            const SCALE: Vector2 = Vector2::splat(10_u32.pow(3) as f64);
+            let x_axis = (v.x_axis * SCALE).round() / SCALE;
+            let y_axis = (v.y_axis * SCALE).round() / SCALE;
+            let z_axis = (v.z_axis * SCALE).round() / SCALE;
+            DAffine2::from_cols(x_axis, y_axis, z_axis).serialize(serializer)
+        }
     }
 
     /// Deserialize a [`DAffine2`]
@@ -66,9 +88,16 @@ pub mod p2d_cuboid_dp3 {
 
     /// Serialize a [Cuboid] rounded to 3 decimal places
     pub fn serialize<S: Serializer>(v: &Cuboid, s: S) -> Result<S::Ok, S::Error> {
-        const D: f64 = (10_u32.pow(3)) as f64;
-        let a = (v.half_extents * D).round();
-        Cuboid::new(a / D).serialize(s)
+        #[cfg(feature = "lossless-serialization")]
+        {
+            v.serialize(s)
+        }
+        #[cfg(not(feature = "lossless-serialization"))]
+        {
+            const D: f64 = (10_u32.pow(3)) as f64;
+            let a = (v.half_extents * D).round();
+            Cuboid::new(a / D).serialize(s)
+        }
     }
 
     /// Deserialize a [Cuboid]
