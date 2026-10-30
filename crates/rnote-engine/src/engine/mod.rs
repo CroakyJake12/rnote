@@ -792,6 +792,103 @@ impl Engine {
             | self.update_rendering_current_viewport()
     }
 
+
+    /// Trash exactly one live native key using the normal donor history.
+    /// The caller owns exclusive engine/task access; this is not a Home grant.
+    /// Busy rendering and active pen gestures refuse before any store mutation.
+    /// Returned flags request rendering; they are not a rendered-frame receipt.
+    pub fn trash_stroke_key(
+        &mut self,
+        key: StrokeKey,
+        now: Instant,
+    ) -> anyhow::Result<WidgetFlags> {
+        self.require_editable_stroke_key(key)?;
+        self.store.set_trashed_keys(&[key], true);
+        let mut flags = self.current_pen_update_state()
+            | self.doc_resize_autoexpand()
+            | self.record(now)
+            | self.update_rendering_current_viewport();
+        flags.store_modified = true;
+        flags.redraw = true;
+        Ok(flags)
+    }
+
+    /// Translate one live key without changing its identity, neighbours or layer.
+    /// None denotes an exact zero delta; it does not record or truncate redo.
+    /// All numerical/admission checks finish on a detached stroke clone first.
+    pub fn translate_stroke_key(
+        &mut self,
+        key: StrokeKey,
+        offset: na::Vector2<f64>,
+        now: Instant,
+    ) -> anyhow::Result<Option<WidgetFlags>> {
+        use crate::strokes::Content;
+        use rnote_compose::shapes::Shapeable;
+        use rnote_compose::transform::Transformable;
+
+        self.require_editable_stroke_key(key)?;
+        if !offset.iter().all(|value| value.is_finite()) {
+            anyhow::bail!("Native stroke translation must be finite");
+        }
+        if offset == na::Vector2::zeros() {
+            return Ok(None);
+        }
+        let mut candidate = self.store.get_stroke_ref(key)
+            .ok_or_else(|| anyhow::anyhow!("Native stroke key is unavailable"))?.clone();
+        Self::check_keyed_translation_bounds(candidate.bounds(), offset)?;
+        candidate.translate(offset);
+        candidate.update_geometry();
+        for bounds in std::iter::once(candidate.bounds()).chain(candidate.hitboxes()) {
+            for axis in 0..2 {
+                if !bounds.mins[axis].is_finite() || !bounds.maxs[axis].is_finite()
+                    || bounds.mins[axis] > bounds.maxs[axis] {
+                    anyhow::bail!("Native stroke translation has invalid donor geometry");
+                }
+            }
+        }
+
+        // Reuse the donor's live COW mutation, spatial index and geometry cache.
+        // Never load an EngineSnapshot to simulate a live edit: that resets undo.
+        self.store.translate_strokes(&[key], offset);
+        self.store.update_geometry_for_strokes(&[key]);
+        let mut flags = self.current_pen_update_state()
+            | self.doc_resize_autoexpand()
+            | self.record(now)
+            | self.update_rendering_current_viewport();
+        flags.store_modified = true;
+        flags.redraw = true;
+        Ok(Some(flags))
+    }
+
+    fn require_editable_stroke_key(&self, key: StrokeKey) -> anyhow::Result<()> {
+        if matches!(self.penholder.current_pen_progress(), rnote_compose::penevent::PenProgress::InProgress) {
+            anyhow::bail!("Finish the original pen gesture before a keyed edit");
+        }
+        if self.store.get_stroke_ref(key).is_none() || self.store.trashed(key) != Some(false) {
+            anyhow::bail!("Native stroke key is unknown, stale or trashed");
+        }
+        match self.store.render_comp_state(key) {
+            Some(RenderCompState::BusyRenderingInTask) | None =>
+                anyhow::bail!("Settle the original render task before a keyed edit"),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_keyed_translation_bounds(bounds: Aabb, offset: na::Vector2<f64>) -> anyhow::Result<()> {
+        for axis in 0..2 {
+            let old_min = bounds.mins[axis];
+            let old_max = bounds.maxs[axis];
+            let new_min = old_min + offset[axis];
+            let new_max = old_max + offset[axis];
+            if !old_min.is_finite() || !old_max.is_finite() || old_min > old_max
+                || !new_min.is_finite() || !new_max.is_finite()
+                || (old_max > old_min && new_max <= new_min) {
+                anyhow::bail!("Native stroke translation overflows or loses representable geometry");
+            }
+        }
+        Ok(())
+    }
+
     pub fn trash_selection(&mut self) -> WidgetFlags {
         let selection_keys = self.store.selection_keys_as_rendered();
         self.store.set_trashed_keys(&selection_keys, true);
@@ -911,5 +1008,132 @@ impl Engine {
     pub fn current_pen_style_w_override(&self) -> PenStyle {
         self.penholder
             .current_pen_style_w_override(&engine_view!(self))
+    }
+}
+
+
+#[cfg(test)]
+mod keyed_stroke_edit_tests {
+    use super::*;
+    use crate::strokes::{BrushStroke, Stroke};
+    use rnote_compose::{PenPath, Style};
+    use rnote_compose::penpath::Element;
+    use rnote_compose::shapes::Shapeable;
+    use slotmap::Key;
+
+    fn brush() -> Stroke {
+        let path = PenPath::try_from_elements([
+            Element::new(na::vector![10_000.0, 10_000.0], 0.2),
+            Element::new(na::vector![10_020.0, 10_010.0], 0.7),
+            Element::new(na::vector![10_040.0, 10_005.0], 1.0),
+        ]).unwrap();
+        Stroke::BrushStroke(BrushStroke::from_penpath(path, Style::default()))
+    }
+
+    fn fixture() -> (Engine, StrokeKey, StrokeKey, StrokeKey) {
+        let mut engine = Engine::default();
+        // Keep cache task production out of these geometry/history controls.
+        // Actual viewport rendering/async ownership needs its own native checks.
+        engine.camera.set_size(na::vector![1.0, 1.0]);
+        engine.camera.set_viewport_center(na::vector![-1_000_000.0, -1_000_000.0]);
+        let first = engine.store.insert_stroke(brush(), None);
+        let neighbour = engine.store.insert_stroke(brush(), None);
+        let stale = engine.store.insert_stroke(brush(), None);
+        assert!(engine.store.remove_stroke(stale).is_some());
+        engine.record(Instant::now());
+        (engine, first, neighbour, stale)
+    }
+
+    fn entry(engine: &Engine) -> serde_json::Value {
+        serde_json::to_value(engine.store.create_history_entry()).unwrap()
+    }
+
+    fn stroke(engine: &Engine, key: StrokeKey) -> serde_json::Value {
+        serde_json::to_value(engine.store.get_stroke_ref(key).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn keyed_trash_preserves_overlapping_neighbour_and_restores_same_key_on_undo_redo() {
+        let (mut engine, target, neighbour, stale) = fixture();
+        let original = stroke(&engine, target);
+        let neighbour_before = stroke(&engine, neighbour);
+        assert!(engine.trash_stroke_key(target, Instant::now()).unwrap().store_modified);
+        assert!(!engine.take_snapshot().stroke_components.contains_key(target));
+        assert!(engine.take_snapshot().stroke_components.contains_key(neighbour));
+        assert_eq!(stroke(&engine, neighbour), neighbour_before);
+        let deleted = entry(&engine);
+        assert!(engine.trash_stroke_key(target, Instant::now()).is_err());
+        assert!(engine.trash_stroke_key(stale, Instant::now()).is_err());
+        assert!(engine.trash_stroke_key(StrokeKey::null(), Instant::now()).is_err());
+        assert_eq!(entry(&engine), deleted);
+        assert!(engine.can_undo());
+        engine.undo(Instant::now());
+        assert!(engine.take_snapshot().stroke_components.contains_key(target));
+        assert_eq!(stroke(&engine, target), original);
+        assert_eq!(stroke(&engine, neighbour), neighbour_before);
+        assert!(engine.can_redo());
+        engine.redo(Instant::now());
+        assert!(!engine.take_snapshot().stroke_components.contains_key(target));
+        assert!(engine.take_snapshot().stroke_components.contains_key(neighbour));
+    }
+
+    #[test]
+    fn keyed_translate_updates_real_spatial_queries_and_one_history_step() {
+        let (mut engine, target, neighbour, _) = fixture();
+        let before = stroke(&engine, target);
+        let other = stroke(&engine, neighbour);
+        let old_bounds = engine.store.get_stroke_ref(target).unwrap().bounds();
+        let original_order = engine.store.stroke_keys_as_rendered();
+        let delta = na::vector![1_000.0, 700.0];
+        assert!(engine.translate_stroke_key(target, delta, Instant::now()).unwrap().unwrap().store_modified);
+        let moved_bounds = engine.store.get_stroke_ref(target).unwrap().bounds();
+        for axis in 0..2 {
+            assert!((moved_bounds.mins[axis] - old_bounds.mins[axis] - delta[axis]).abs() < 1e-8);
+            assert!((moved_bounds.maxs[axis] - old_bounds.maxs[axis] - delta[axis]).abs() < 1e-8);
+        }
+        assert_eq!(engine.store.stroke_keys_as_rendered(), original_order);
+        assert_eq!(stroke(&engine, neighbour), other);
+        let old_hits = engine.store.stroke_keys_as_rendered_intersecting_bounds(old_bounds);
+        assert!(!old_hits.contains(&target));
+        assert!(old_hits.contains(&neighbour));
+        let new_hits = engine.store.stroke_keys_as_rendered_intersecting_bounds(moved_bounds);
+        assert!(new_hits.contains(&target));
+        assert!(!new_hits.contains(&neighbour));
+        let moved = stroke(&engine, target);
+        engine.undo(Instant::now());
+        assert_eq!(stroke(&engine, target), before);
+        assert_eq!(stroke(&engine, neighbour), other);
+        assert!(engine.store.stroke_keys_as_rendered_intersecting_bounds(old_bounds).contains(&target));
+        engine.redo(Instant::now());
+        assert_eq!(stroke(&engine, target), moved);
+        assert_eq!(stroke(&engine, neighbour), other);
+    }
+
+    #[test]
+    fn rejected_and_zero_edits_preserve_real_state_and_available_redo() {
+        let (mut engine, target, _, stale) = fixture();
+        engine.translate_stroke_key(target, na::vector![30.0, 40.0], Instant::now()).unwrap().unwrap();
+        engine.undo(Instant::now());
+        assert!(engine.can_redo());
+        let before = entry(&engine);
+        assert!(engine.translate_stroke_key(target, na::Vector2::zeros(), Instant::now()).unwrap().is_none());
+        for delta in [na::vector![f64::NAN, 0.0], na::vector![0.0, f64::INFINITY], na::vector![f64::MAX, 0.0]] {
+            assert!(engine.translate_stroke_key(target, delta, Instant::now()).is_err());
+            assert_eq!(entry(&engine), before);
+            assert!(engine.can_redo());
+        }
+        assert!(engine.translate_stroke_key(stale, na::vector![1.0, 1.0], Instant::now()).is_err());
+        assert!(engine.trash_stroke_key(stale, Instant::now()).is_err());
+        assert_eq!(entry(&engine), before);
+        assert!(engine.can_redo());
+        engine.redo(Instant::now());
+        assert_ne!(entry(&engine), before);
+    }
+
+    #[test]
+    fn finite_delta_overflow_is_rejected_before_donor_mutation() {
+        let bounds = Aabb::new(na::point![f64::MAX * 0.6, 0.0], na::point![f64::MAX * 0.8, 1.0]);
+        assert!(Engine::check_keyed_translation_bounds(bounds, na::vector![f64::MAX * 0.6, 0.0]).is_err());
+        assert!(Engine::check_keyed_translation_bounds(bounds, na::vector![0.0, 1.0]).is_ok());
     }
 }
