@@ -22,6 +22,15 @@ impl Default for TrashComponent {
     }
 }
 
+/// Exact lineage captured while the donor splits its own path segments.
+/// This records one immediate parent and the first retained parent segment.
+#[derive(Debug, Clone)]
+pub struct SplitStrokeLineage {
+    pub native_key: StrokeKey,
+    pub source_key: StrokeKey,
+    pub source_segment_offset: usize,
+}
+
 /// Systems that are related to trashing.
 impl StrokeStore {
     /// Rebuild the slotmap with empty trash components with the keys returned from the stroke components.
@@ -131,8 +140,20 @@ impl StrokeStore {
         eraser_bounds: Aabb,
         viewport: Aabb,
     ) -> (Vec<StrokeKey>, WidgetFlags) {
+        let (keys, flags, _) = self.split_colliding_strokes_traced(eraser_bounds, viewport);
+        (keys, flags)
+    }
+
+    /// The same SplitColliding algorithm, with lineage emitted at each actual
+    /// retained slice and insertion. No before/after geometry matching guesses.
+    pub(crate) fn split_colliding_strokes_traced(
+        &mut self,
+        eraser_bounds: Aabb,
+        viewport: Aabb,
+    ) -> (Vec<StrokeKey>, WidgetFlags, Vec<SplitStrokeLineage>) {
         let mut widget_flags = WidgetFlags::default();
         let mut modified_keys = vec![];
+        let mut lineage = vec![];
 
         let new_strokes = self
             .stroke_keys_as_rendered_intersecting_bounds(viewport)
@@ -170,7 +191,7 @@ impl StrokeStore {
 
                                     // skip splits that don't have at least two segments (one's end as path start, one additional)
                                     if split_slice.len() > 1 {
-                                        split.push(split_slice.to_vec());
+                                        split.push((split_slice.to_vec(), prev));
                                     }
 
                                     prev = hit;
@@ -179,10 +200,10 @@ impl StrokeStore {
                                 // Catch the last
                                 let last_split = &brushstroke.path.segments[prev..];
                                 if last_split.len() > 1 {
-                                    split.push(last_split.to_vec());
+                                    split.push((last_split.to_vec(), prev));
                                 }
 
-                                for next_split in split {
+                                for (next_split, source_offset) in split {
                                     let mut next_split_iter = next_split.into_iter();
                                     let next_start = next_split_iter.next().unwrap().end();
 
@@ -192,6 +213,8 @@ impl StrokeStore {
                                             brushstroke.style.clone(),
                                         )),
                                         chrono_comp.layer,
+                                        key,
+                                        source_offset + 1,
                                     ));
                                 }
 
@@ -203,6 +226,9 @@ impl StrokeStore {
                                         brushstroke.path.start,
                                         first_split.to_vec(),
                                     ));
+                                    lineage.push(SplitStrokeLineage {
+                                        native_key: key, source_key: key, source_segment_offset: 0,
+                                    });
                                 } else {
                                     trash_current_stroke = true;
                                 }
@@ -233,12 +259,16 @@ impl StrokeStore {
 
                 new_strokes
             })
-            .collect::<Vec<(Stroke, StrokeLayer)>>();
+            .collect::<Vec<(Stroke, StrokeLayer, StrokeKey, usize)>>();
 
         modified_keys.append(
             &mut new_strokes
                 .into_iter()
-                .map(|(new_stroke, layer)| self.insert_stroke(new_stroke, Some(layer)))
+                .map(|(new_stroke, layer, source_key, source_segment_offset)| {
+                    let native_key = self.insert_stroke(new_stroke, Some(layer));
+                    lineage.push(SplitStrokeLineage { native_key, source_key, source_segment_offset });
+                    native_key
+                })
                 .collect(),
         );
 
@@ -247,6 +277,6 @@ impl StrokeStore {
             widget_flags.resize = true;
         }
 
-        (modified_keys, widget_flags)
+        (modified_keys, widget_flags, lineage)
     }
 }

@@ -793,6 +793,79 @@ impl Engine {
     }
 
 
+    /// Drain real queued headless render results before a keyed mutation.
+    /// A deadline/budget failure refuses the next edit; no fake render completion.
+    /// The receiver remains owned by this Engine on every return path.
+    pub fn settle_headless_render_tasks(&mut self) -> anyhow::Result<()> {
+        let mut receiver = self.tasks_rx.take()
+            .ok_or_else(|| anyhow::anyhow!("The original engine task receiver is not owned here"))?;
+        let result = (|| {
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            let mut consumed = 0usize;
+            loop {
+                loop {
+                    #[allow(deprecated)]
+                    match receiver.0.try_next() {
+                        Ok(Some(task)) => {
+                            consumed += 1;
+                            if consumed > 65536 {
+                                anyhow::bail!("Headless render task budget exceeded");
+                            }
+                            if self.handle_engine_task(task).1 {
+                                anyhow::bail!("Original engine requested shutdown");
+                            }
+                        }
+                        Ok(None) => anyhow::bail!("Original engine task channel closed"),
+                        Err(_) => break,
+                    }
+                }
+                let busy = self.store.stroke_keys_unordered().into_iter().any(|key|
+                    matches!(self.store.render_comp_state(key), Some(RenderCompState::BusyRenderingInTask)));
+                if !busy { return Ok(()); }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("Original native render tasks did not settle before the deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })();
+        self.tasks_rx = Some(receiver);
+        result
+    }
+
+    /// A bounded headless invocation of the genuine donor SplitColliding path.
+    /// Caller uses a detached Engine; the original document/history never change.
+    pub fn split_strokes_traced_at(
+        &mut self,
+        element: rnote_compose::penpath::Element,
+        width: f64,
+        now: Instant,
+    ) -> anyhow::Result<Vec<crate::store::trash_comp::SplitStrokeLineage>> {
+        if !width.is_finite() || !(1.0..=500.0).contains(&width)
+            || !element.pos.iter().all(|value| value.is_finite())
+            || !element.pressure.is_finite() || !(0.0..=1.0).contains(&element.pressure)
+            || matches!(self.penholder.current_pen_progress(), rnote_compose::penevent::PenProgress::InProgress) {
+            anyhow::bail!("Invalid or unfinished native split gesture");
+        }
+        self.settle_headless_render_tasks()?;
+        let config = crate::pens::pensconfig::eraserconfig::EraserConfig {
+            width,
+            style: crate::pens::pensconfig::eraserconfig::EraserStyle::SplitCollidingStrokes,
+        };
+        let bounds = config.eraser_bounds(element);
+        if !bounds.mins.iter().chain(bounds.maxs.iter()).all(|value| value.is_finite()) {
+            anyhow::bail!("Split eraser bounds overflow");
+        }
+        // The immutable proposal covers all document ink under the exact eraser
+        // bounds, independently of an offscreen/default headless camera viewport.
+        let (modified, flags, lineage) = self.store.split_colliding_strokes_traced(bounds, bounds);
+        if flags.store_modified {
+            self.store.update_geometry_for_strokes(&modified);
+            self.store.regenerate_rendering_for_strokes(&modified, bounds, self.camera.image_scale());
+            let _ = self.current_pen_update_state() | self.doc_resize_autoexpand() | self.record(now);
+        }
+        Ok(lineage)
+    }
+
     /// Trash exactly one live native key using the normal donor history.
     /// The caller owns exclusive engine/task access; this is not a Home grant.
     /// Busy rendering and active pen gestures refuse before any store mutation.
